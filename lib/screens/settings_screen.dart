@@ -6,6 +6,7 @@ import '../services/ai_service.dart';
 import '../services/shizuku_service.dart';
 import '../services/screen_automation_service.dart';
 import '../services/telegram_service.dart';
+import 'ai_providers_screen.dart';
 import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
@@ -439,6 +440,38 @@ class _SettingsScreenState extends State<SettingsScreen>
                       },
                     ),
                   );
+                },
+              ),
+            ],
+          ),
+
+          // 1.5 Multiple AI Providers (speed + reliability)
+          _buildSettingsCard(
+            icon: Icons.bolt_rounded,
+            title: 'AI Providers (multiple, for speed)',
+            subtitle: 'Add several free/fast providers — Lara auto-skips busy ones',
+            isDark: isDark,
+            children: [
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.tune_rounded, color: Color(0xFF8B5CF6)),
+                title: const Text('Manage AI providers'),
+                subtitle: Text(
+                  '${widget.aiService.providers.where((p) => p.isConfigured).length} configured',
+                ),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () async {
+                  await Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => AiProvidersScreen(aiService: widget.aiService),
+                    ),
+                  );
+                  setState(() {
+                    _apiKeyController.text = widget.aiService.apiKey;
+                    _baseUrlController.text = widget.aiService.baseUrl;
+                    _modelController.text = widget.aiService.model;
+                  });
                 },
               ),
             ],
