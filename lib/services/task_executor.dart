@@ -89,7 +89,8 @@ Rules:
 - Keep reasoning very brief (1 sentence)
 ''';
 
-  /// Extract JSON safely even if wrapped in markdown or conversational text
+  /// Extract JSON safely even if wrapped in markdown or conversational text,
+  /// or slightly truncated (missing a closing brace/quote).
   String _extractJson(String text) {
     // 1. Try to find a markdown json code block
     final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
@@ -100,9 +101,23 @@ Rules:
 
     // 2. Fallback: find the first { and the last }
     final startIndex = text.indexOf('{');
-    final endIndex = text.lastIndexOf('}');
+    var endIndex = text.lastIndexOf('}');
     if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
       return text.substring(startIndex, endIndex + 1);
+    }
+
+    // 3. The model got cut off before closing the JSON object — recover by
+    // balancing braces/quotes on what we do have instead of giving up.
+    if (startIndex != -1) {
+      String candidate = text.substring(startIndex);
+      final openBraces = '{'.allMatches(candidate).length;
+      final closeBraces = '}'.allMatches(candidate).length;
+      final openQuotes = '"'.allMatches(candidate).length;
+      if (openQuotes.isOdd) candidate += '"';
+      if (openBraces > closeBraces) {
+        candidate += '}' * (openBraces - closeBraces);
+      }
+      return candidate;
     }
 
     return text.trim();
@@ -167,6 +182,7 @@ Rules:
     String lastAction = '';
     int sameActionCount = 0;
     int consecutiveFailures = 0;
+    int consecutiveParseFailures = 0;
     String lastFailedAction = '';
     int totalTokens = 0;
     final List<ActionStep> executedSteps = [];
@@ -367,23 +383,21 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         return 'Task cancelled.';
       }
 
-      // 4. Parse the action (with one retry on failure)
+      // 4. Parse the action — resilient: bad formatting from the AI should
+      // never end the whole task or leak raw technical text into the chat.
       Map<String, dynamic>? actionJson;
       String? parsedJsonStr;
       try {
         String jsonStr = _extractJson(response);
-
         actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
         parsedJsonStr = jsonStr;
       } catch (firstError) {
-        // First attempt failed — retry once
         developer.log(
           '=== JSON PARSE FAILED, RETRYING ===\nError: $firstError\nRaw: $response',
           name: 'PrivateAgent',
         );
-        _report('Retrying step ${step + 1}...\n(Failed to parse: $firstError)');
-        // Wait 2 seconds before retrying to prevent rate-limit spam
-        await Future.delayed(const Duration(seconds: 2));
+        // Short pause, then ask again — no technical detail shown to the user.
+        await Future.delayed(const Duration(milliseconds: 600));
         try {
           final retryResponse = await _aiService.sendTaskMessage(
             _taskSystemPrompt,
@@ -399,27 +413,39 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
           parsedJsonStr = jsonStr;
         } catch (e) {
-          results.add('Step ${step + 1}: Error after retry: $e');
-
-          String debugInfo = 'Error: $e';
-          _report('AI Error: $debugInfo\n\nRaw output:\n${response}');
-
-          await _notificationService.showTaskCompleteNotification(
-            'Task Error',
-            'AI formatting error.',
+          developer.log(
+            '=== RETRY ALSO FAILED ===\nError: $e\nRaw: $response',
+            name: 'PrivateAgent',
           );
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Failed',
-            totalTokens,
-            step,
-            results,
-          );
-          await _screenService.showToast('Agent Error: $e');
-          await Future.delayed(const Duration(seconds: 3));
-          return 'I could not understand the AI response. Please try again.';
+          consecutiveParseFailures++;
+
+          // Give up gracefully only after several bad responses in a row —
+          // a single hiccup from a fast/free model should never kill the task.
+          if (consecutiveParseFailures >= 3) {
+            results.add('Stopped: AI response could not be understood after $consecutiveParseFailures attempts.');
+            _report('I got stuck understanding the next step, so I stopped here.');
+            await _notificationService.showTaskCompleteNotification(
+              'Task Stopped',
+              'Lara could not understand the AI response after several tries.',
+            );
+            await TaskHistoryLogger.logTask(
+              userGoal,
+              'Failed',
+              totalTokens,
+              step,
+              results,
+            );
+            await _screenService.showToast('Stopped — please try again');
+            return 'I got stuck partway through. Please try again — it may work on the next attempt.';
+          }
+
+          // Otherwise: skip this step cleanly, re-read the screen, and try again.
+          results.add('Step ${step + 1}: had trouble reading the AI response, retrying.');
+          continue;
         }
       }
+
+      consecutiveParseFailures = 0;
 
       final action = actionJson['action'] as String? ?? 'done';
       final params = actionJson['params'] as Map<String, dynamic>? ?? {};
@@ -431,7 +457,9 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         name: 'PrivateAgent',
       );
 
-      _report('Step ${step + 1}: $reasoning');
+      if (reasoning.trim().isNotEmpty) {
+        _report(reasoning.trim());
+      }
 
       sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
       final repeatLimit = action == 'press_enter'
