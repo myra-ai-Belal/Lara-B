@@ -243,19 +243,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_appLifecycleState != AppLifecycleState.paused) return;
 
     if (!await FlutterOverlayWindow.isActive()) {
-      await FlutterOverlayWindow.showOverlay(
-        enableDrag: true,
-        overlayTitle: 'PrivateAgent',
-        overlayContent: 'Performing task...',
-        flag: OverlayFlag.focusPointer,
-        alignment: OverlayAlignment.centerRight,
-        visibility: NotificationVisibility.visibilitySecret,
-        positionGravity: PositionGravity.auto,
-        startPosition: const OverlayPosition(0, 200),
-        width: 56,
-        height: 56,
-      );
-      await Future<void>.delayed(const Duration(milliseconds: 300));
+      try {
+        await FlutterOverlayWindow.showOverlay(
+          enableDrag: true,
+          overlayTitle: 'PrivateAgent',
+          overlayContent: 'Performing task...',
+          flag: OverlayFlag.focusPointer,
+          alignment: OverlayAlignment.centerRight,
+          visibility: NotificationVisibility.visibilitySecret,
+          positionGravity: PositionGravity.auto,
+          startPosition: const OverlayPosition(0, 200),
+          width: 56,
+          height: 56,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      } catch (e) {
+        // The floating bubble is a nice-to-have; never let it block or crash a task.
+        return;
+      }
     }
 
     // Keep the overlay minimized during automation. The user can still tap the
@@ -433,20 +438,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (generation != _overlayUpdateGeneration) return;
       if (_appLifecycleState != AppLifecycleState.paused) return;
       if (await FlutterOverlayWindow.isActive()) return;
-      await FlutterOverlayWindow.showOverlay(
-        enableDrag: true,
-        overlayTitle: "PrivateAgent",
-        overlayContent: _isLoading
-            ? "Performing task..."
-            : "Floating Assistant",
-        flag: OverlayFlag.focusPointer,
-        alignment: OverlayAlignment.centerRight,
-        visibility: NotificationVisibility.visibilitySecret,
-        positionGravity: PositionGravity.auto,
-        startPosition: const OverlayPosition(0, 200),
-        width: 56,
-        height: 56,
-      );
+      try {
+        await FlutterOverlayWindow.showOverlay(
+          enableDrag: true,
+          overlayTitle: "PrivateAgent",
+          overlayContent: _isLoading
+              ? "Performing task..."
+              : "Floating Assistant",
+          flag: OverlayFlag.focusPointer,
+          alignment: OverlayAlignment.centerRight,
+          visibility: NotificationVisibility.visibilitySecret,
+          positionGravity: PositionGravity.auto,
+          startPosition: const OverlayPosition(0, 200),
+          width: 56,
+          height: 56,
+        );
+      } catch (e) {
+        return; // Never let the floating bubble crash the app.
+      }
       if (_isLoading && _appLifecycleState == AppLifecycleState.paused) {
         // Give the overlay isolate time to attach its listener, then send the
         // full active conversation. A second snapshot makes cold starts
