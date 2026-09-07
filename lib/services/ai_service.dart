@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import '../models/llm_provider_profile.dart';
 
 class AiResponse {
   final String content;
@@ -16,9 +17,6 @@ class AiService {
   static const String nvidiaBaseUrl = 'https://integrate.api.nvidia.com/v1';
   static const String nvidiaDefaultModel = 'z-ai/glm-5.2';
 
-  /// Free, general-purpose chat endpoints verified in NVIDIA's NIM catalog.
-  /// The live /models response is intersected with this list so unavailable or
-  /// non-chat models never appear in PrivateAgent's NVIDIA model picker.
   static const List<String> nvidiaFreeChatModels = [
     'z-ai/glm-5.2',
     'nvidia/nemotron-3-nano-30b-a3b',
@@ -48,9 +46,16 @@ class AiService {
         .toList(growable: false);
   }
 
+  // ---- Legacy single-provider fields (kept for backward compatibility with
+  // existing Settings UI). These now always mirror the active provider. ----
   String? _apiKey;
   String _baseUrl = _defaultBaseUrl;
   String _model = _defaultModel;
+
+  // ---- Multiple provider profiles with automatic fallback ----
+  List<LlmProviderProfile> _providers = [];
+  int _activeProviderIndex = 0; // last-known-good provider; tried first
+
   int _maxSteps = 15;
   bool _disableMaxSteps = false;
   double _temperature = 1.0;
@@ -107,9 +112,40 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
-    _apiKey = prefs.getString('api_key');
-    _baseUrl = prefs.getString('api_base_url') ?? _defaultBaseUrl;
-    _model = prefs.getString('api_model') ?? _defaultModel;
+
+    final providersJson = prefs.getString('llm_providers');
+    if (providersJson != null && providersJson.isNotEmpty) {
+      try {
+        final List<dynamic> decoded = jsonDecode(providersJson);
+        _providers = decoded
+            .map((e) => LlmProviderProfile.fromJson(e as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        _providers = [];
+      }
+    }
+
+    if (_providers.isEmpty) {
+      final legacyKey = prefs.getString('api_key');
+      final legacyBaseUrl = prefs.getString('api_base_url') ?? _defaultBaseUrl;
+      final legacyModel = prefs.getString('api_model') ?? _defaultModel;
+      _providers = [
+        LlmProviderProfile(
+          name: 'Primary',
+          baseUrl: legacyBaseUrl,
+          apiKey: legacyKey ?? '',
+          model: legacyModel,
+        ),
+      ];
+    }
+
+    _activeProviderIndex = prefs.getInt('llm_active_provider_index') ?? 0;
+    if (_activeProviderIndex >= _providers.length) {
+      _activeProviderIndex = 0;
+    }
+
+    _syncLegacyFieldsFromProviders();
+
     _maxSteps = prefs.getInt('api_max_steps') ?? 15;
     _disableMaxSteps = prefs.getBool('api_disable_max_steps') ?? false;
     _temperature = prefs.getDouble('api_temperature') ?? 1.0;
@@ -118,6 +154,35 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     _useSystemPrompt = prefs.getBool('api_use_system_prompt') ?? true;
   }
 
+  void _syncLegacyFieldsFromProviders() {
+    if (_providers.isEmpty) return;
+    final active = _providers[_activeProviderIndex];
+    _apiKey = active.apiKey;
+    _baseUrl = active.baseUrl;
+    _model = active.model;
+  }
+
+  Future<void> saveProviders(List<LlmProviderProfile> providers) async {
+    final prefs = await SharedPreferences.getInstance();
+    _providers = providers;
+    if (_activeProviderIndex >= _providers.length) {
+      _activeProviderIndex = 0;
+    }
+    await prefs.setString(
+      'llm_providers',
+      jsonEncode(_providers.map((p) => p.toJson()).toList()),
+    );
+    _syncLegacyFieldsFromProviders();
+    if (_providers.isNotEmpty) {
+      await prefs.setString('api_key', _providers[_activeProviderIndex].apiKey);
+      await prefs.setString('api_base_url', _providers[_activeProviderIndex].baseUrl);
+      await prefs.setString('api_model', _providers[_activeProviderIndex].model);
+    }
+  }
+
+  List<LlmProviderProfile> get providers => List.unmodifiable(_providers);
+  int get activeProviderIndex => _activeProviderIndex;
+
   Future<void> saveSettings({
     required String apiKey,
     String? baseUrl,
@@ -125,7 +190,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }) async {
     final prefs = await SharedPreferences.getInstance();
 
-    // Clean up the API key in case the user pasted "Bearer sk-..."
     String cleanApiKey = apiKey.trim();
     if (cleanApiKey.toLowerCase().startsWith('bearer ')) {
       cleanApiKey = cleanApiKey.substring(7).trim();
@@ -142,6 +206,28 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       _model = model;
       await prefs.setString('api_model', model);
     }
+
+    if (_providers.isEmpty) {
+      _providers = [
+        LlmProviderProfile(
+          name: 'Primary',
+          baseUrl: _baseUrl,
+          apiKey: _apiKey ?? '',
+          model: _model,
+        ),
+      ];
+    } else {
+      _providers[_activeProviderIndex] = LlmProviderProfile(
+        name: _providers[_activeProviderIndex].name,
+        baseUrl: _baseUrl,
+        apiKey: _apiKey ?? '',
+        model: _model,
+      );
+    }
+    await prefs.setString(
+      'llm_providers',
+      jsonEncode(_providers.map((p) => p.toJson()).toList()),
+    );
   }
 
   Future<void> saveMaxSteps(int steps) async {
@@ -173,24 +259,22 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     await prefs.setBool('api_use_system_prompt', useSystemPrompt);
   }
 
-  bool get isConfigured => _apiKey != null && _apiKey!.isNotEmpty;
+  bool get isConfigured =>
+      _providers.any((p) => p.isConfigured) ||
+      (_apiKey != null && _apiKey!.isNotEmpty);
   String get baseUrl => _baseUrl;
   String get model => _model;
   String get apiKey => _apiKey ?? '';
   int get maxSteps => _disableMaxSteps ? 999 : _maxSteps;
-  int get rawMaxSteps => _maxSteps; // For the slider UI
+  int get rawMaxSteps => _maxSteps;
   bool get disableMaxSteps => _disableMaxSteps;
   double get temperature => _temperature;
   int get maxTokens => _maxTokens;
   bool get useScreenCompression => _useScreenCompression;
   bool get useSystemPrompt => _useSystemPrompt;
 
-  int get _effectiveMaxTokens {
-    // GLM is a reasoning model. With the app's 1,024-token default it can
-    // consume the whole budget reasoning and finish without visible content.
-    if (isNvidiaBaseUrl(_baseUrl) &&
-        _model == nvidiaDefaultModel &&
-        _maxTokens < 4096) {
+  int _effectiveMaxTokensFor(String baseUrl, String model) {
+    if (isNvidiaBaseUrl(baseUrl) && model == nvidiaDefaultModel && _maxTokens < 4096) {
       return 4096;
     }
     return _maxTokens;
@@ -207,129 +291,123 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a message to the AI and get a response.
+  List<int> _providerTryOrder() {
+    final configuredIndexes = <int>[
+      for (int i = 0; i < _providers.length; i++)
+        if (_providers[i].isConfigured) i,
+    ];
+    if (configuredIndexes.isEmpty) return [];
+    configuredIndexes.sort((a, b) {
+      if (a == _activeProviderIndex) return -1;
+      if (b == _activeProviderIndex) return 1;
+      return 0;
+    });
+    return configuredIndexes;
+  }
+
+  bool _isRetryableStatus(int statusCode) {
+    return statusCode == 429 || statusCode >= 500;
+  }
+
+  String _buildRequestUrl(String baseUrl) {
+    String requestUrl = baseUrl;
+    if (requestUrl.endsWith('/chat/completions')) return requestUrl;
+    if (requestUrl.endsWith('/')) return '${requestUrl}chat/completions';
+    return '$requestUrl/chat/completions';
+  }
+
   Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
-    if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+    final tryOrder = _providerTryOrder();
+    if (tryOrder.isEmpty) {
+      throw Exception('No AI provider is configured. Please go to Settings.');
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
     _conversationHistory.add({'role': 'user', 'content': message});
-
-    // Keep conversation history manageable (last 20 messages)
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
     }
 
-    try {
-      // Build the prompt including system instructions
-      final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
-      final messages = [
-        if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-        ..._conversationHistory,
-      ];
+    Object? lastError;
+    for (final providerIndex in tryOrder) {
+      final provider = _providers[providerIndex];
+      try {
+        final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
+        final messages = [
+          if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
+          ..._conversationHistory,
+        ];
 
-      String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl; // User already included it
-      } else {
-        if (requestUrl.endsWith('/')) {
-          requestUrl = '${requestUrl}chat/completions';
-        } else {
-          requestUrl = '$requestUrl/chat/completions';
-        }
-      }
+        final requestUrl = _buildRequestUrl(provider.baseUrl);
+        final requestBody = jsonEncode({
+          'model': provider.model,
+          'messages': messages,
+          'temperature': _temperature,
+          'max_tokens': _effectiveMaxTokensFor(provider.baseUrl, provider.model),
+        });
 
-      final requestBody = jsonEncode({
-        'model': _model,
-        'messages': messages,
-        'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
-      });
+        developer.log('API Request [${provider.name}]: $requestUrl', name: 'AiService');
 
-      developer.log(
-        'API Request: $requestUrl\n$requestBody',
-        name: 'AiService',
-      );
+        final response = await http
+            .post(
+              Uri.parse(requestUrl),
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ${provider.apiKey}',
+                'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
+                'X-Title': 'Lara AI',
+              },
+              body: requestBody,
+            )
+            .timeout(const Duration(seconds: 30));
 
-      final response = await http
-          .post(
-            Uri.parse(requestUrl),
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $_apiKey',
-              'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-              'X-Title': 'PrivateAgent',
-            },
-            body: requestBody,
-          )
-          .timeout(const Duration(minutes: 30));
-
-      developer.log(
-        'API Response [${response.statusCode}]: ${response.body}',
-        name: 'AiService',
-      );
-
-      if (response.statusCode != 200) {
-        String errorMessage = response.body;
-        try {
-          final decoded = jsonDecode(response.body);
-          if (decoded is Map<String, dynamic>) {
-            if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage =
-                  decoded['error']['message']?.toString() ?? response.body;
-            } else if (decoded['error'] is String) {
-              errorMessage = decoded['error'];
-            }
+        if (response.statusCode != 200) {
+          if (_isRetryableStatus(response.statusCode)) {
+            lastError = Exception('${provider.name}: HTTP ${response.statusCode}');
+            continue;
           }
-        } catch (_) {
-          // ignore parsing errors, use raw body
+          throw Exception('API error (${response.statusCode}): ${response.body}');
         }
-        throw Exception('API error (${response.statusCode}): $errorMessage');
+
+        final data = jsonDecode(response.body);
+        if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
+          lastError = Exception('${provider.name}: unexpected response format');
+          continue;
+        }
+
+        String assistantMessage = data['choices'][0]['message']['content'] as String;
+        assistantMessage = assistantMessage
+            .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
+            .trim();
+
+        if (assistantMessage.isEmpty) {
+          lastError = Exception('${provider.name}: empty response');
+          continue;
+        }
+
+        _activeProviderIndex = providerIndex;
+        _saveActiveProviderIndex();
+        _conversationHistory.add({'role': 'assistant', 'content': assistantMessage});
+        return assistantMessage;
+      } catch (e) {
+        lastError = e;
+        continue;
       }
-
-      final data = jsonDecode(response.body);
-      if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
-        throw Exception('Unexpected API response format: $data');
-      }
-
-      String assistantMessage =
-          data['choices'][0]['message']['content'] as String;
-
-      // Strip <think> blocks commonly produced by reasoning models
-      assistantMessage = assistantMessage
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-          .trim();
-
-      if (assistantMessage.trim().isEmpty) {
-        throw Exception(
-          'API returned an empty response. This may be due to rate limits or API instability.',
-        );
-      }
-
-      _conversationHistory.add({
-        'role': 'assistant',
-        'content': assistantMessage,
-      });
-
-      return assistantMessage;
-    } catch (e) {
-      if (e is Exception) rethrow;
-      throw Exception('Network error: $e');
     }
+
+    throw Exception('All AI providers failed. Last error: $lastError');
   }
 
-  /// Send a message and stream the response chunk-by-chunk.
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
   }) async* {
-    if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+    final tryOrder = _providerTryOrder();
+    if (tryOrder.isEmpty) {
+      throw Exception('No AI provider is configured. Please go to Settings.');
     }
+    final provider = _providers[tryOrder.first];
 
     _conversationHistory.add({'role': 'user', 'content': message});
-
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
     }
@@ -341,62 +419,37 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         ..._conversationHistory,
       ];
 
-      String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl;
-      } else {
-        if (requestUrl.endsWith('/')) {
-          requestUrl = '${requestUrl}chat/completions';
-        } else {
-          requestUrl = '$requestUrl/chat/completions';
-        }
-      }
+      final requestUrl = _buildRequestUrl(provider.baseUrl);
 
       final client = http.Client();
       final request = http.Request('POST', Uri.parse(requestUrl));
       request.headers.addAll({
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer $_apiKey',
+        'Authorization': 'Bearer ${provider.apiKey}',
         'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-        'X-Title': 'PrivateAgent',
+        'X-Title': 'Lara AI',
       });
 
       request.body = jsonEncode({
-        'model': _model,
+        'model': provider.model,
         'messages': messages,
         'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
+        'max_tokens': _effectiveMaxTokensFor(provider.baseUrl, provider.model),
         'stream': true,
       });
 
-      final response = await client
-          .send(request)
-          .timeout(const Duration(minutes: 30));
+      final response = await client.send(request).timeout(const Duration(seconds: 30));
 
       if (response.statusCode != 200) {
         final body = await response.stream.bytesToString();
-        String errorMessage = body;
-        try {
-          final decoded = jsonDecode(body);
-          if (decoded is Map<String, dynamic>) {
-            if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage = decoded['error']['message']?.toString() ?? body;
-            } else if (decoded['error'] is String) {
-              errorMessage = decoded['error'];
-            }
-          }
-        } catch (_) {}
         client.close();
-        throw Exception('API error (${response.statusCode}): $errorMessage');
+        throw Exception('API error (${response.statusCode}): $body');
       }
 
       final accumulatedContent = StringBuffer();
       bool inThinkBlock = false;
 
-      // Listen to response stream
-      final lineStream = response.stream
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
+      final lineStream = response.stream.transform(utf8.decoder).transform(const LineSplitter());
 
       await for (final line in lineStream) {
         final trimmedLine = line.trim();
@@ -418,21 +471,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                   final content = rawContent;
                   accumulatedContent.write(content);
 
-                  // Handle <think> block stripping on the fly for better stream styling
                   if (content.contains('<think>')) {
                     inThinkBlock = true;
-                    // If there is text before <think>, yield it
                     final parts = content.split('<think>');
-                    if (parts[0].isNotEmpty) {
-                      yield parts[0];
-                    }
+                    if (parts[0].isNotEmpty) yield parts[0];
                   } else if (content.contains('</think>')) {
                     inThinkBlock = false;
-                    // If there is text after </think>, yield it
                     final parts = content.split('</think>');
-                    if (parts.length > 1 && parts[1].isNotEmpty) {
-                      yield parts[1];
-                    }
+                    if (parts.length > 1 && parts[1].isNotEmpty) yield parts[1];
                   } else if (!inThinkBlock) {
                     yield content;
                   }
@@ -440,25 +486,19 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 if (choice['finish_reason'] != null) break;
               }
             }
-          } catch (_) {
-            // Ignore incomplete chunks
-          }
+          } catch (_) {}
         }
       }
 
       client.close();
+      _activeProviderIndex = tryOrder.first;
+      _saveActiveProviderIndex();
 
-      // Clean up final accumulated response and add to history
       String finalResponse = accumulatedContent.toString().trim();
-      finalResponse = finalResponse
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-          .trim();
+      finalResponse = finalResponse.replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '').trim();
 
       if (finalResponse.isEmpty) {
-        throw Exception(
-          'The model finished without a visible answer. Increase Max Tokens '
-          'or try another NVIDIA model.',
-        );
+        throw Exception('The model finished without a visible answer. Increase Max Tokens or try another model.');
       }
       _conversationHistory.add({'role': 'assistant', 'content': finalResponse});
     } catch (e) {
@@ -467,123 +507,116 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
-  /// This is much faster and cheaper than sendMessage.
   Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
-    if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+    final tryOrder = _providerTryOrder();
+    if (tryOrder.isEmpty) {
+      throw Exception('No AI provider is configured. Please go to Settings.');
     }
 
-    int maxRetries = 4;
-    int currentTry = 0;
+    Object? lastError;
 
-    while (true) {
-      try {
-        currentTry++;
-        final messages = [
-          if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-          {'role': 'user', 'content': prompt},
-        ];
+    for (final providerIndex in tryOrder) {
+      final provider = _providers[providerIndex];
 
-        String requestUrl = _baseUrl;
-        if (!requestUrl.endsWith('/chat/completions')) {
-          if (requestUrl.endsWith('/')) {
-            requestUrl = '${requestUrl}chat/completions';
-          } else {
-            requestUrl = '$requestUrl/chat/completions';
-          }
-        }
+      const maxRetriesPerProvider = 1;
+      for (int attempt = 0; attempt <= maxRetriesPerProvider; attempt++) {
+        try {
+          final messages = [
+            if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
+            {'role': 'user', 'content': prompt},
+          ];
 
-        final response = await http
-            .post(
-              Uri.parse(requestUrl),
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer $_apiKey',
-                'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-                'X-Title': 'PrivateAgent',
-              },
-              body: jsonEncode({
-                'model': _model,
-                'messages': messages,
-                'temperature': _temperature,
-                'max_tokens': _effectiveMaxTokens,
-              }),
-            )
-            .timeout(const Duration(minutes: 30));
+          final requestUrl = _buildRequestUrl(provider.baseUrl);
 
-        if (response.statusCode != 200) {
-          String errorMessage = response.body;
-          try {
-            final decoded = jsonDecode(response.body);
-            if (decoded is Map<String, dynamic>) {
-              if (decoded['error'] is Map<String, dynamic>) {
-                errorMessage = decoded['error']['message'] ?? response.body;
-              } else if (decoded['error'] is String) {
-                errorMessage = decoded['error'];
-              }
+          final response = await http
+              .post(
+                Uri.parse(requestUrl),
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ${provider.apiKey}',
+                  'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
+                  'X-Title': 'Lara AI',
+                },
+                body: jsonEncode({
+                  'model': provider.model,
+                  'messages': messages,
+                  'temperature': _temperature,
+                  'max_tokens': _effectiveMaxTokensFor(provider.baseUrl, provider.model),
+                }),
+              )
+              .timeout(const Duration(seconds: 20));
+
+          if (response.statusCode != 200) {
+            if (_isRetryableStatus(response.statusCode)) {
+              lastError = Exception('${provider.name}: HTTP ${response.statusCode}');
+              break;
             }
-          } catch (_) {
-            // ignore parsing errors, use raw body
+            String errorMessage = response.body;
+            try {
+              final decoded = jsonDecode(response.body);
+              if (decoded is Map<String, dynamic> && decoded['error'] != null) {
+                errorMessage = decoded['error'] is Map
+                    ? (decoded['error']['message']?.toString() ?? response.body)
+                    : decoded['error'].toString();
+              }
+            } catch (_) {}
+            throw Exception('API error (${response.statusCode}): $errorMessage');
           }
-          throw Exception('API error (${response.statusCode}): $errorMessage');
-        }
 
-        final data = jsonDecode(response.body);
-        if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
-          throw Exception('Unexpected API response format: $data');
-        }
-        String content = data['choices'][0]['message']['content'] as String;
+          final data = jsonDecode(response.body);
+          if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
+            lastError = Exception('${provider.name}: unexpected response format');
+            break;
+          }
 
-        // Strip <think> blocks commonly produced by reasoning models
-        content = content
-            .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-            .trim();
+          String content = data['choices'][0]['message']['content'] as String;
+          content = content.replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '').trim();
 
-        if (content.trim().isEmpty) {
-          throw Exception(
-            'API returned an empty response. This may be due to strict rate limits or safety filters.',
-          );
-        }
+          if (content.isEmpty) {
+            lastError = Exception('${provider.name}: empty response');
+            break;
+          }
 
-        int tokens = 0;
-        if (data.containsKey('usage') &&
-            data['usage']['total_tokens'] != null) {
-          tokens = data['usage']['total_tokens'] as int;
+          int tokens = 0;
+          if (data.containsKey('usage') && data['usage']['total_tokens'] != null) {
+            tokens = data['usage']['total_tokens'] as int;
+          }
+
+          _activeProviderIndex = providerIndex;
+          _saveActiveProviderIndex();
+          return AiResponse(content, tokens);
+        } catch (e) {
+          lastError = e;
+          if (attempt < maxRetriesPerProvider) {
+            await Future.delayed(const Duration(milliseconds: 500));
+            continue;
+          }
+          break;
         }
-        return AiResponse(content, tokens);
-      } catch (e) {
-        if (currentTry > maxRetries) {
-          if (e is Exception) rethrow;
-          throw Exception('Network error after $maxRetries retries: $e');
-        }
-        int delaySeconds = 3 * currentTry;
-        developer.log(
-          'API call failed ($e), retrying $currentTry/$maxRetries in $delaySeconds seconds...',
-          name: 'PrivateAgent',
-        );
-        await Future.delayed(Duration(seconds: delaySeconds));
       }
     }
+
+    throw Exception('All AI providers failed. Last error: $lastError');
   }
 
-  /// Parse the AI response to check if it's an action or plain text
+  Future<void> _saveActiveProviderIndex() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('llm_active_provider_index', _activeProviderIndex);
+  }
+
   AgentAction? parseAction(String response) {
-    // Try to parse as JSON action
     try {
       final trimmed = response.trim();
-      // Handle if the response is wrapped in code fences
       String jsonStr = trimmed;
       if (trimmed.startsWith('```')) {
         final lines = trimmed.split('\n');
-        lines.removeAt(0); // Remove opening fence
+        lines.removeAt(0);
         if (lines.isNotEmpty && lines.last.trim() == '```') {
-          lines.removeLast(); // Remove closing fence
+          lines.removeLast();
         }
         jsonStr = lines.join('\n').trim();
       }
 
-      // If it looks like JSON but is missing a closing brace (common with some local models)
       if (jsonStr.startsWith('{') && !jsonStr.endsWith('}')) {
         jsonStr += '\n}';
       }
@@ -595,7 +628,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             return AgentAction.fromJson(json);
           }
         } catch (e) {
-          // If it still fails, it might be deeply truncated, try adding another brace
           if (e.toString().contains('Unexpected end of input')) {
             jsonStr += '\n}';
             final json = jsonDecode(jsonStr) as Map<String, dynamic>;
@@ -605,20 +637,13 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           }
         }
       }
-    } catch (_) {
-      // Not JSON, it's plain text conversation
-    }
+    } catch (_) {}
     return null;
   }
 
-  /// Fetches available models from the provider's /models endpoint
-  Future<List<String>> fetchAvailableModels(
-    String baseUrl,
-    String apiKey,
-  ) async {
+  Future<List<String>> fetchAvailableModels(String baseUrl, String apiKey) async {
     try {
       String cleanBaseUrl = baseUrl;
-      // Many providers host it at /models, but some require the base URL without /chat/completions logic
       if (cleanBaseUrl.endsWith('/chat/completions')) {
         cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
       }
