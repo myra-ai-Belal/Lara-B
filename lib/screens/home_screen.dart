@@ -12,6 +12,7 @@ import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
 import '../services/notification_service.dart';
 import 'settings_screen.dart';
+import 'call_screen.dart';
 import 'task_history_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
@@ -246,7 +247,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       try {
         await FlutterOverlayWindow.showOverlay(
           enableDrag: true,
-          overlayTitle: 'PrivateAgent',
+          overlayTitle: 'Lara AI',
           overlayContent: 'Performing task...',
           flag: OverlayFlag.focusPointer,
           alignment: OverlayAlignment.centerRight,
@@ -441,7 +442,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       try {
         await FlutterOverlayWindow.showOverlay(
           enableDrag: true,
-          overlayTitle: "PrivateAgent",
+          overlayTitle: "Lara AI",
           overlayContent: _isLoading
               ? "Performing task..."
               : "Floating Assistant",
@@ -500,7 +501,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             children: [
               TextSpan(
-                text: 'Private',
+                text: 'Lara',
                 style: TextStyle(
                   fontWeight: FontWeight.w900,
                   color: Theme.of(context).colorScheme.primary,
@@ -508,7 +509,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ),
               ),
               const TextSpan(
-                text: 'Agent',
+                text: ' AI',
                 style: TextStyle(
                   fontWeight: FontWeight.w400,
                   letterSpacing: -0.5,
@@ -527,6 +528,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.call_rounded, color: Color(0xFF22C55E)),
+            tooltip: 'Call Lara',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => CallScreen(aiService: _aiService),
+                  fullscreenDialog: true,
+                ),
+              );
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.add_comment_outlined),
             tooltip: 'New chat',
@@ -751,7 +765,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   size: 26,
                 ),
                 const SizedBox(width: 12),
-                Text('PrivateAgent', style: headerStyle),
+                Text('Lara AI', style: headerStyle),
               ],
             ),
           ),
