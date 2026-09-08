@@ -60,7 +60,7 @@ class _OverlayAppState extends State<OverlayApp> {
       ChatMessage(
         role: 'assistant',
         content:
-            'Hi! I am your Private Agent. Ask me to perform any task on your screen.',
+            "Hi! I'm Lara. Ask me to do anything on your phone.",
       ),
     );
   }
@@ -426,7 +426,7 @@ class _OverlayAppState extends State<OverlayApp> {
                       ),
                       const SizedBox(width: 8),
                       const Text(
-                        'Private Agent',
+                        'Lara AI',
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
@@ -439,7 +439,7 @@ class _OverlayAppState extends State<OverlayApp> {
                     children: [
                       Semantics(
                         button: true,
-                        label: 'Open PrivateAgent',
+                        label: 'Open Lara AI',
                         child: GestureDetector(
                           onTap: () => unawaited(_openMainApp()),
                           child: const Padding(
